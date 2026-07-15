@@ -1,22 +1,28 @@
 package api
 
 import (
-	"encoding/json"
-	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	"charm.land/log/v2"
-	gh "github.com/cli/go-gh/v2/pkg/api"
-	checks "github.com/dlvhdr/x/gh-checks"
-	"github.com/shurcooL/githubv4"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
+
+	glclient "github.com/dlvhdr/gh-enhance/internal/gitlab"
 )
 
+// --- Normalized status/conclusion vocabulary consumed by the TUI ---
+//
+// GitLab reports a single status string per job/pipeline. To keep the TUI
+// (which was built around GitHub's split of "status" + "conclusion") working
+// unchanged, we normalize each GitLab status into a Status (lifecycle) and a
+// Conclusion (terminal result).
+
+type Status string
+
+type Conclusion string
+
 const (
-	// Run statuses
 	StatusQueued     Status = "QUEUED"
 	StatusCompleted  Status = "COMPLETED"
 	StatusInProgress Status = "IN_PROGRESS"
@@ -24,7 +30,6 @@ const (
 	StatusWaiting    Status = "WAITING"
 	StatusPending    Status = "PENDING"
 
-	// Run conclusions
 	ConclusionActionRequired Conclusion = "ACTION_REQUIRED"
 	ConclusionCancelled      Conclusion = "CANCELLED"
 	ConclusionFailure        Conclusion = "FAILURE"
@@ -34,32 +39,26 @@ const (
 	ConclusionStartupFailure Conclusion = "STARTUP_FAILURE"
 	ConclusionSuccess        Conclusion = "SUCCESS"
 	ConclusionTimedOut       Conclusion = "TIMED_OUT"
-
-	// Check run states
-	CheckRunStateQueued         CheckRunState = "QUEUED"
-	CheckRunStateCompleted      CheckRunState = "COMPLETED"
-	CheckRunStateInProgress     CheckRunState = "IN_PROGRESS"
-	CheckRunStateRequested      CheckRunState = "REQUESTED"
-	CheckRunStateWaiting        CheckRunState = "WAITING"
-	CheckRunStatePending        CheckRunState = "PENDING"
-	CheckRunStateActionRequired CheckRunState = "ACTION_REQUIRED"
-	CheckRunStateCancelled      CheckRunState = "CANCELLED"
-	CheckRunStateFailure        CheckRunState = "FAILURE"
-	CheckRunStateNeutral        CheckRunState = "NEUTRAL"
-	CheckRunStateSkipped        CheckRunState = "SKIPPED"
-	CheckRunStateStale          CheckRunState = "STALE"
-	CheckRunStateStartupFailure CheckRunState = "STARTUP_FAILURE"
-	CheckRunStateSuccess        CheckRunState = "SUCCESS"
-	CheckRunStateTimedOut       CheckRunState = "TIMED_OUT"
-
-	GithubActionsAppName = "GitHub Actions"
 )
 
-type Status string
+// PipelineStatus is the raw GitLab status vocabulary (lowercase strings).
+type PipelineStatus string
 
-type Conclusion string
-
-type CheckRunState string
+const (
+	StatusGLCreated            PipelineStatus = "created"
+	StatusGLWaitingForResource PipelineStatus = "waiting_for_resource"
+	StatusGLPreparing          PipelineStatus = "preparing"
+	StatusGLPending            PipelineStatus = "pending"
+	StatusGLRunning            PipelineStatus = "running"
+	StatusGLSuccess            PipelineStatus = "success"
+	StatusGLFailed             PipelineStatus = "failed"
+	StatusGLCanceled           PipelineStatus = "canceled"
+	StatusGLCanceling          PipelineStatus = "canceling"
+	StatusGLSkipped            PipelineStatus = "skipped"
+	StatusGLManual             PipelineStatus = "manual"
+	StatusGLScheduled          PipelineStatus = "scheduled"
+	StatusGLWaitingForCallback PipelineStatus = "waiting_for_callback"
+)
 
 func IsFailureConclusion(c Conclusion) bool {
 	switch c {
@@ -71,70 +70,42 @@ func IsFailureConclusion(c Conclusion) bool {
 	}
 }
 
-// CheckSuite is a grouping of CheckRuns
-type CheckSuite struct {
-	Conclusion Conclusion
-	DatabaseId int
-	Branch     struct {
-		Name string
-	}
-	App struct {
-		Id   string
-		Name string
-	}
-
-	// A WorkflowRun has one CheckSuite and is defined by a GitHub Action's file
-	WorkflowRun struct {
-		Url                       string
-		DatabaseId                int
-		Event                     string
-		RunNumber                 int
-		PendingDeploymentRequests struct {
-			Nodes []struct {
-				Environment struct {
-					Name string
-				}
-			}
-		} `graphql:"pendingDeploymentRequests(first: 1)"`
-		Workflow struct {
-			Name string
-		}
+// StatusFromGitLab maps a GitLab status onto the lifecycle Status the TUI uses
+// to decide whether to show a spinner.
+func StatusFromGitLab(status string) Status {
+	switch PipelineStatus(status) {
+	case StatusGLRunning, StatusGLCanceling:
+		return StatusInProgress
+	case StatusGLPending, StatusGLCreated, StatusGLPreparing,
+		StatusGLWaitingForResource, StatusGLWaitingForCallback:
+		return StatusPending
+	case StatusGLScheduled:
+		return StatusWaiting
+	default: // success, failed, canceled, skipped, manual
+		return StatusCompleted
 	}
 }
 
-// Represents an individual commit status context
-// E.g. a Vercel deployment preview
-type StatusContext struct {
-	Context     string
-	Description string
-	State       Conclusion
+// ConclusionFromGitLab maps a GitLab status onto a terminal Conclusion. Returns
+// an empty Conclusion for non-terminal states.
+func ConclusionFromGitLab(status string) Conclusion {
+	switch PipelineStatus(status) {
+	case StatusGLSuccess:
+		return ConclusionSuccess
+	case StatusGLFailed:
+		return ConclusionFailure
+	case StatusGLCanceled, StatusGLCanceling:
+		return ConclusionCancelled
+	case StatusGLSkipped:
+		return ConclusionSkipped
+	case StatusGLManual:
+		return ConclusionNeutral
+	default:
+		return ""
+	}
 }
 
-// CheckRun is a job running in CI on a specific commit. It is part of a CheckSuite.
-type CheckRun struct {
-	Id          string
-	Name        string
-	Status      Status
-	Title       string
-	Url         string
-	DetailsUrl  string
-	Conclusion  Conclusion
-	DatabaseId  int
-	StartedAt   time.Time
-	CompletedAt time.Time
-	CheckSuite  CheckSuite
-}
-
-// CheckRunWithSteps includes some basic identifying data for the check run as well as its steps
-type CheckRunWithSteps struct {
-	Id         string
-	DatabaseId int
-	Url        string
-	Steps      struct {
-		Nodes []Step
-	} `graphql:"steps(first: 100)"`
-}
-
+// Step is a section within a job trace (the GitLab equivalent of a build step).
 type Step struct {
 	Conclusion  Conclusion
 	Name        string
@@ -144,514 +115,218 @@ type Step struct {
 	Status      Status
 }
 
-type CommitState string
+// --- Domain values passed from the api layer to the tui layer ---
 
-const (
-	CommitStateExpected CommitState = "EXPECTED" // Note: expected check runs are currently not listed in the API. See https://github.com/cli/cli/issues/6448
-	CommitStateError    CommitState = "ERROR"
-	CommitStateFailure  CommitState = "FAILURE"
-	CommitStatePending  CommitState = "PENDING"
-	CommitStateSuccess  CommitState = "SUCCESS"
-)
-
-type PageInfo struct {
-	EndCursor       string
-	HasNextPage     bool
-	HasPreviousPage bool
+type Pipeline struct {
+	ID        int64
+	IID       int64
+	Ref       string
+	SHA       string
+	Status    string
+	Source    string
+	WebURL    string
+	CreatedAt time.Time
+	StartedAt time.Time
+	MRIID     int
 }
 
-type ContextNode struct {
-	Typename      string        `graphql:"__typename"`
-	CheckRun      CheckRun      `graphql:"... on CheckRun"`
-	StatusContext StatusContext `graphql:"... on StatusContext"`
+type Job struct {
+	ID           int64
+	Name         string
+	Stage        string
+	Status       string
+	WebURL       string
+	AllowFailure bool
+	StartedAt    time.Time
+	FinishedAt   time.Time
 }
 
-type PRWithChecks struct {
-	Title      string
-	Number     int
-	Url        string
-	Repository struct {
-		NameWithOwner string
+func deref(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
 	}
-	Merged      bool
-	IsDraft     bool
-	Closed      bool
-	HeadRefName string
-	Commits     struct {
-		Nodes []struct {
-			Commit struct {
-				StatusCheckRollup struct {
-					State    CommitState
-					Contexts struct {
-						TotalCount                 int
-						CheckRunCount              int
-						CheckRunCountsByState      []checks.ContextCountByState
-						StatusContextCount         int
-						StatusContextCountsByState []checks.ContextCountByState
-						Nodes                      []ContextNode
-						PageInfo                   PageInfo
-					} `graphql:"contexts(first: 100, after: $cursor)"`
-				}
-			}
-		}
-	} `graphql:"commits(last: 1)"`
+	return *t
 }
 
-type RateLimit struct {
-	Cost      int64
-	Limit     int64
-	NodeCount int64
-	Remaining int64
-	ResetAt   time.Time
-	Used      int64
-}
-
-type PRCheckRunsQuery struct {
-	RateLimit RateLimit
-	Resource  struct {
-		PullRequest PRWithChecks `graphql:"... on PullRequest"`
-	} `graphql:"resource(url: $url)"`
-}
-
-var (
-	gqlClient  *gh.GraphQLClient
-	httpClient *http.Client
-)
-
-func SetClient(c *gh.GraphQLClient) {
-	gqlClient = c
-}
-
-func getGraphQLClient() (*gh.GraphQLClient, error) {
-	var err error
-	if gqlClient != nil {
-		return gqlClient, nil
-	}
-	gqlClient, err = gh.DefaultGraphQLClient()
-	return gqlClient, err
-}
-
-func getHTTPClient() (*http.Client, error) {
-	var err error
-	if httpClient != nil {
-		return httpClient, nil
-	}
-	httpClient, err = gh.DefaultHTTPClient()
-	return httpClient, err
-}
-
-func FetchPRCheckRuns(repo string, prNumber string, cursor string) (PRCheckRunsQuery, error) {
-	var err error
-	var res PRCheckRunsQuery
-	c, err := getGraphQLClient()
+// GetPipeline fetches a single pipeline by numeric ID.
+func GetPipeline(project string, pipelineID int64) (Pipeline, error) {
+	c, err := glclient.RESTClient()
 	if err != nil {
-		return res, err
+		return Pipeline{}, err
 	}
-
-	parsedUrl, err := url.Parse(fmt.Sprintf("https://github.com/%s/pull/%s", repo, prNumber))
+	p, _, err := c.Pipelines.GetPipeline(project, pipelineID)
 	if err != nil {
-		return res, err
+		log.Error("error fetching pipeline", "err", err)
+		return Pipeline{}, err
 	}
-	variables := map[string]any{
-		"url":    githubv4.URI{URL: parsedUrl},
-		"cursor": githubv4.String(cursor),
-	}
-
-	startTime := time.Now()
-	err = c.Query("FetchCheckRuns", &res, variables)
-	if err != nil {
-		log.Error("error fetching check runs", "err", err)
-		return res, err
-	}
-	log.Debug("FetchPRCheckRuns request completed", "duration", time.Since(startTime))
-	return res, nil
+	return Pipeline{
+		ID:        p.ID,
+		IID:       p.IID,
+		Ref:       p.Ref,
+		SHA:       p.SHA,
+		Status:    strings.ToLower(p.Status),
+		Source:    string(p.Source),
+		WebURL:    p.WebURL,
+		CreatedAt: deref(p.CreatedAt),
+		StartedAt: deref(p.StartedAt),
+	}, nil
 }
 
-type WorkflowRunStepsQuery struct {
-	Resource struct {
-		WorkflowRun struct {
-			Id   string
-			File struct {
-				Path string
-			}
-			CheckSuite struct {
-				Branch struct {
-					Name string
-				}
-				CheckRuns struct {
-					Nodes []CheckRunWithSteps
-				} `graphql:"checkRuns(first: 100)"`
-			}
-		} `graphql:"... on WorkflowRun"`
-	} `graphql:"resource(url: $url)"`
+// GetLatestPipeline returns the latest pipeline for a ref (branch/tag).
+func GetLatestPipeline(project string, ref string) (Pipeline, error) {
+	c, err := glclient.RESTClient()
+	if err != nil {
+		return Pipeline{}, err
+	}
+	opt := &gitlab.GetLatestPipelineOptions{}
+	if ref != "" {
+		opt.Ref = gitlab.Ptr(ref)
+	}
+	p, _, err := c.Pipelines.GetLatestPipeline(project, opt)
+	if err != nil {
+		log.Error("error fetching latest pipeline", "err", err)
+		return Pipeline{}, err
+	}
+	return Pipeline{
+		ID:        p.ID,
+		IID:       p.IID,
+		Ref:       p.Ref,
+		SHA:       p.SHA,
+		Status:    strings.ToLower(p.Status),
+		Source:    string(p.Source),
+		WebURL:    p.WebURL,
+		CreatedAt: deref(p.CreatedAt),
+		StartedAt: deref(p.StartedAt),
+	}, nil
 }
 
-func FetchWorkflowRunSteps(repo string, runID string) (WorkflowRunStepsQuery, error) {
-	res := WorkflowRunStepsQuery{}
-	c, err := getGraphQLClient()
+// ListMRPipelines returns every pipeline attached to a merge request, newest
+// first. Used to populate the pipeline-history pane in MR mode.
+func ListMRPipelines(project string, mrIID int) ([]Pipeline, error) {
+	c, err := glclient.RESTClient()
 	if err != nil {
-		return res, err
+		return nil, err
 	}
-
-	runUrl, err := url.Parse(fmt.Sprintf("https://github.com/%s/actions/runs/%s", repo, runID))
+	infos, _, err := c.MergeRequests.ListMergeRequestPipelines(project, int64(mrIID))
 	if err != nil {
-		return res, err
+		log.Error("error listing MR pipelines", "err", err)
+		return nil, err
 	}
-	variables := map[string]any{
-		"url": githubv4.URI{URL: runUrl},
-	}
-
-	log.Debug("fetching check run steps", "url", runUrl)
-	startTime := time.Now()
-	err = c.Query("FetchCheckRunSteps", &res, variables)
-	if err != nil {
-		log.Error("error fetching check run steps", "err", err)
-		return res, err
-	}
-
-	log.Debug("FetchWorkflowRunSteps request completed", "duration", time.Since(startTime))
-	return res, nil
-}
-
-type httpStep struct {
-	Conclusion  string
-	Name        string
-	Number      int
-	StartedAt   time.Time `json:"started_at"`
-	CompletedAt time.Time `json:"completed_at"`
-	Status      string
-}
-
-type jobStepsResponse struct {
-	Id           int
-	Url          string
-	WorkflowName string
-	Steps        []httpStep
-}
-
-type NormalizedJobStepsResponse struct {
-	Id           int
-	Url          string
-	WorkflowName string
-	Steps        []Step
-}
-
-func FetchJobSteps(repo string, jobID string) (NormalizedJobStepsResponse, error) {
-	res := NormalizedJobStepsResponse{}
-	c, err := getHTTPClient()
-	if err != nil {
-		return res, err
-	}
-
-	jobUrl, err := url.Parse(
-		fmt.Sprintf("https://api.github.com/repos/%s/actions/jobs/%s", repo, jobID),
-	)
-	if err != nil {
-		return res, err
-	}
-
-	log.Debug("fetching job steps", "url", jobUrl)
-	startTime := time.Now()
-	resp, err := c.Get(jobUrl.String())
-	if err != nil {
-		return res, err
-	}
-	log.Debug("FetchJobSteps request completed", "duration", time.Since(startTime))
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return res, err
-	}
-
-	raw := jobStepsResponse{}
-	err = json.Unmarshal(body, &raw)
-	if err != nil {
-		log.Error("error fetching job steps", "err", err)
-		return res, err
-	}
-
-	normalized := make([]Step, 0)
-	for _, job := range raw.Steps {
-		normalized = append(normalized, Step{
-			Conclusion:  Conclusion(strings.ToUpper(job.Conclusion)),
-			Name:        job.Name,
-			Number:      job.Number,
-			StartedAt:   job.StartedAt,
-			CompletedAt: job.CompletedAt,
-			Status:      Status(strings.ToUpper(job.Status)),
+	pipelines := make([]Pipeline, 0, len(infos))
+	for _, p := range infos {
+		pipelines = append(pipelines, Pipeline{
+			ID:        p.ID,
+			IID:       p.IID,
+			Ref:       p.Ref,
+			SHA:       p.SHA,
+			Status:    strings.ToLower(p.Status),
+			Source:    p.Source,
+			WebURL:    p.WebURL,
+			CreatedAt: deref(p.CreatedAt),
+			MRIID:     mrIID,
 		})
 	}
-	res.Id = raw.Id
-	res.Url = raw.Url
-	res.WorkflowName = raw.WorkflowName
-	res.Steps = normalized
-
-	return res, nil
+	return pipelines, nil
 }
 
-type CheckRunOutputResponse struct {
-	Id     int
-	Name   string
-	Url    string
-	Output CheckRunOutput
-}
-
-type CheckRunOutput struct {
-	Title       string
-	Summary     string
-	Text        string
-	Description string
-}
-
-func FetchCheckRunOutput(repo string, runID string) (CheckRunOutputResponse, error) {
-	client, err := gh.DefaultRESTClient()
-	res := CheckRunOutputResponse{}
+// ListPipelineJobs lists all jobs of a pipeline, following pagination so that
+// jobs on later pages are never silently dropped.
+func ListPipelineJobs(project string, pipelineID int64) ([]Job, error) {
+	c, err := glclient.RESTClient()
 	if err != nil {
-		return res, err
+		return nil, err
 	}
-
-	startTime := time.Now()
-	err = client.Get(fmt.Sprintf("repos/%s/check-runs/%s", repo, runID), &res)
-	if err != nil {
-		return res, err
+	opts := &gitlab.ListJobsOptions{
+		ListOptions: gitlab.ListOptions{PerPage: 100},
 	}
-
-	log.Debug("FetchCheckRunOutput request completed", "duration", time.Since(startTime))
-	return res, nil
-}
-
-func (pr *PRWithChecks) IsStatusCheckInProgress() bool {
-	if pr == nil || len(pr.Commits.Nodes) == 0 {
-		return true
-	}
-
-	contexts := pr.Commits.Nodes[0].Commit.StatusCheckRollup.Contexts
-	stats := checks.AccumulatedStats(
-		contexts.CheckRunCountsByState,
-		contexts.StatusContextCountsByState,
-	)
-	return (pr.Commits.Nodes[0].Commit.StatusCheckRollup.State == "" ||
-		pr.Commits.Nodes[0].Commit.StatusCheckRollup.State == "PENDING" || stats.InProgress > 0)
-}
-
-func ReRunJob(repo string, jobId string) error {
-	client, err := gh.DefaultRESTClient()
-	if err != nil {
-		return err
-	}
-
-	body := strings.NewReader("")
-	res := struct{}{}
-
-	err = client.Post(fmt.Sprintf("repos/%s/actions/jobs/%s/rerun", repo, jobId), body, res)
-	return err
-}
-
-// REST API response for GET /repos/{owner}/{repo}/actions/runs/{run_id}
-// https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run
-type WorkflowRunResponse struct {
-	Id           int       `json:"id"`
-	Name         string    `json:"name"`
-	HeadBranch   string    `json:"head_branch"`
-	HeadSha      string    `json:"head_sha"`
-	Status       string    `json:"status"`
-	Conclusion   string    `json:"conclusion"`
-	HtmlUrl      string    `json:"html_url"`
-	Event        string    `json:"event"`
-	RunNumber    int       `json:"run_number"`
-	RunAttempt   int       `json:"run_attempt"`
-	WorkflowId   int       `json:"workflow_id"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	RunStartedAt time.Time `json:"run_started_at"`
-	DisplayTitle string    `json:"display_title"`
-	PullRequests []struct {
-		Number int    `json:"number"`
-		Url    string `json:"url"`
-	} `json:"pull_requests"`
-	Repository struct {
-		FullName string `json:"full_name"`
-	} `json:"repository"`
-}
-
-// REST API response for GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs
-// https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run
-type WorkflowRunJobsResponse struct {
-	TotalCount int              `json:"total_count"`
-	Jobs       []WorkflowRunJob `json:"jobs"`
-}
-
-type WorkflowRunJob struct {
-	Id          int        `json:"id"`
-	RunId       int        `json:"run_id"`
-	Name        string     `json:"name"`
-	Status      string     `json:"status"`
-	Conclusion  string     `json:"conclusion"`
-	HtmlUrl     string     `json:"html_url"`
-	StartedAt   time.Time  `json:"started_at"`
-	CompletedAt time.Time  `json:"completed_at"`
-	RunAttempt  int        `json:"run_attempt"`
-	Steps       []httpStep `json:"steps"`
-}
-
-func FetchWorkflowRunByID(repo string, runID string) (WorkflowRunResponse, error) {
-	res := WorkflowRunResponse{}
-	c, err := getHTTPClient()
-	if err != nil {
-		return res, err
-	}
-
-	runUrl, err := url.Parse(
-		fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%s", repo, runID),
-	)
-	if err != nil {
-		return res, err
-	}
-
-	log.Debug("fetching workflow run by ID", "url", runUrl)
-	startTime := time.Now()
-	resp, err := c.Get(runUrl.String())
-	if err != nil {
-		return res, err
-	}
-	log.Debug("FetchWorkflowRunByID request completed", "duration", time.Since(startTime))
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return res, fmt.Errorf(
-			"failed to fetch workflow run %s: %s %s",
-			runID,
-			resp.Status,
-			string(body),
-		)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return res, err
-	}
-
-	err = json.Unmarshal(body, &res)
-	if err != nil {
-		log.Error("error unmarshaling workflow run", "err", err)
-		return res, err
-	}
-
-	return res, nil
-}
-
-func FetchWorkflowRunJobs(repo string, runID string) (WorkflowRunJobsResponse, error) {
-	res := WorkflowRunJobsResponse{}
-	c, err := getHTTPClient()
-	if err != nil {
-		return res, err
-	}
-
-	jobsUrl, err := url.Parse(
-		fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%s/jobs", repo, runID),
-	)
-	if err != nil {
-		return res, err
-	}
-
-	log.Debug("fetching workflow run jobs", "url", jobsUrl)
-	startTime := time.Now()
-	resp, err := c.Get(jobsUrl.String())
-	if err != nil {
-		return res, err
-	}
-	log.Debug("FetchWorkflowRunJobs request completed", "duration", time.Since(startTime))
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return res, fmt.Errorf(
-			"failed to fetch workflow run jobs for run %s: %s %s",
-			runID,
-			resp.Status,
-			string(body),
-		)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return res, err
-	}
-
-	err = json.Unmarshal(body, &res)
-	if err != nil {
-		log.Error("error unmarshaling workflow run jobs", "err", err)
-		return res, err
-	}
-
-	return res, nil
-}
-
-func ReRunRun(repo string, runId string) error {
-	client, err := gh.DefaultRESTClient()
-	if err != nil {
-		return err
-	}
-
-	body := strings.NewReader("")
-	res := struct{}{}
-
-	err = client.Post(fmt.Sprintf("repos/%s/actions/runs/%s/rerun", repo, runId), body, res)
-	return err
-}
-
-type PR struct {
-	Title      string
-	Number     int
-	Url        string
-	Repository struct {
-		NameWithOwner string
-	}
-	Merged      bool
-	IsDraft     bool
-	Closed      bool
-	HeadRefName string
-	Commits     struct {
-		Nodes []struct {
-			Commit struct {
-				StatusCheckRollup struct {
-					State CommitState
-				}
-			}
+	result := make([]Job, 0)
+	for {
+		jobs, resp, err := c.Jobs.ListPipelineJobs(project, pipelineID, opts)
+		if err != nil {
+			log.Error("error listing pipeline jobs", "err", err)
+			return nil, err
 		}
-	} `graphql:"commits(last: 1)"`
+		for _, j := range jobs {
+			result = append(result, Job{
+				ID:           j.ID,
+				Name:         j.Name,
+				Stage:        j.Stage,
+				Status:       strings.ToLower(j.Status),
+				WebURL:       j.WebURL,
+				AllowFailure: j.AllowFailure,
+				StartedAt:    deref(j.StartedAt),
+				FinishedAt:   deref(j.FinishedAt),
+			})
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return result, nil
 }
 
-type PRQuery struct {
-	Resource struct {
-		PullRequest PR `graphql:"... on PullRequest"`
-	} `graphql:"resource(url: $url)"`
+// GetJobTrace fetches the raw trace (log) of a job.
+func GetJobTrace(project string, jobID int64) (string, error) {
+	c, err := glclient.RESTClient()
+	if err != nil {
+		return "", err
+	}
+	reader, _, err := c.Jobs.GetTraceFile(project, jobID)
+	if err != nil {
+		log.Error("error fetching job trace", "err", err)
+		return "", err
+	}
+	b, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
-func FetchPR(repo string, prNumber string) (PRQuery, error) {
-	var err error
-	var res PRQuery
-	c, err := getGraphQLClient()
-	if err != nil {
-		return res, err
-	}
+// --- Mutations ---
 
-	parsedUrl, err := url.Parse(fmt.Sprintf("https://github.com/%s/pull/%s", repo, prNumber))
+func RetryJob(project string, jobID int64) error {
+	c, err := glclient.RESTClient()
 	if err != nil {
-		return res, err
+		return err
 	}
-	variables := map[string]any{
-		"url": githubv4.URI{URL: parsedUrl},
-	}
+	_, _, err = c.Jobs.RetryJob(project, jobID)
+	return err
+}
 
-	startTime := time.Now()
-	err = c.Query("FetchPR", &res, variables)
+func PlayJob(project string, jobID int64) error {
+	c, err := glclient.RESTClient()
 	if err != nil {
-		log.Error("error fetching PR", "err", err)
-		return res, err
+		return err
 	}
+	_, _, err = c.Jobs.PlayJob(project, jobID, nil)
+	return err
+}
 
-	log.Debug("FetchPR request completed", "duration", time.Since(startTime))
-	return res, nil
+func CancelJob(project string, jobID int64) error {
+	c, err := glclient.RESTClient()
+	if err != nil {
+		return err
+	}
+	_, _, err = c.Jobs.CancelJob(project, jobID)
+	return err
+}
+
+func RetryPipeline(project string, pipelineID int64) error {
+	c, err := glclient.RESTClient()
+	if err != nil {
+		return err
+	}
+	_, _, err = c.Pipelines.RetryPipelineBuild(project, pipelineID)
+	return err
+}
+
+func CancelPipeline(project string, pipelineID int64) error {
+	c, err := glclient.RESTClient()
+	if err != nil {
+		return err
+	}
+	_, _, err = c.Pipelines.CancelPipelineBuild(project, pipelineID)
+	return err
 }

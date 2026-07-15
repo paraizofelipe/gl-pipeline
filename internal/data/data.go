@@ -8,40 +8,46 @@ import (
 	"github.com/dlvhdr/gh-enhance/internal/api"
 )
 
-// WorkflowRun holds all the the jobs that were part of it
-// It is defined by a workflow file that defines the jobs to run
+// WorkflowRun models a GitLab pipeline. The type name is kept for continuity
+// with the TUI, which consumes this shape; semantically it is a pipeline that
+// holds the jobs that ran as part of it.
 type WorkflowRun struct {
 	Id           string
 	Name         string
 	DisplayTitle string
 	Link         string
 	Workflow     string
-	Event        string
+	Event        string // pipeline source (push, merge_request_event, ...)
 	Jobs         []WorkflowJob
 	Bucket       CheckBucket
 	StartedAt    time.Time
-	RunNumber    int
-	PRNumber     int
+	RunNumber    int // pipeline IID
+	PRNumber     int // merge request IID, when known
 }
 
+// WorkflowJob models a single GitLab CI job. Its Steps are the sections parsed
+// from the job trace, and its Logs hold the parsed trace lines.
 type WorkflowJob struct {
-	Id          string
-	State       api.Status
-	Conclusion  api.Conclusion
-	Name        string
-	Title       string
-	Workflow    string
-	PendingEnv  string
-	Event       string
-	Logs        []LogsWithTime
-	Link        string
-	Steps       []api.Step
-	StartedAt   time.Time
-	CompletedAt time.Time
-	Bucket      CheckBucket
-	Kind        JobKind
+	Id           string
+	State        api.Status
+	Conclusion   api.Conclusion
+	Name         string
+	Title        string
+	Stage        string // GitLab stage the job belongs to (build, test, ...)
+	Workflow     string
+	PendingEnv   string
+	Event        string
+	Logs         []LogsWithTime
+	Link         string
+	Steps        []api.Step
+	StartedAt    time.Time
+	CompletedAt  time.Time
+	Bucket       CheckBucket
+	Kind         JobKind
+	AllowFailure bool
+	IsManual     bool
 
-	// A number that uniquely identifies this workflow run in its parent workflow.
+	// RunNumber uniquely identifies the parent pipeline (its IID).
 	RunNumber int
 }
 
@@ -84,19 +90,22 @@ const (
 	CheckBucketNeutral
 )
 
-func GetConclusionBucket(conclusion api.Conclusion) CheckBucket {
-	switch conclusion {
-	case "SUCCESS":
+// BucketFromStatus maps a GitLab pipeline/job status (lowercase) to a bucket.
+func BucketFromStatus(status string) CheckBucket {
+	switch api.PipelineStatus(status) {
+	case api.StatusGLSuccess:
 		return CheckBucketPass
-	case "SKIPPED":
-		return CheckBucketSkipping
-	case "NEUTRAL":
-		return CheckBucketNeutral
-	case "ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED":
+	case api.StatusGLFailed:
 		return CheckBucketFail
-	case "CANCELLED":
+	case api.StatusGLCanceled, api.StatusGLCanceling:
 		return CheckBucketCancel
-	default: // "EXPECTED", "REQUESTED", "WAITING", "QUEUED", "PENDING", "IN_PROGRESS", "STALE"
+	case api.StatusGLSkipped:
+		return CheckBucketSkipping
+	case api.StatusGLManual:
+		return CheckBucketNeutral
+	default:
+		// created, waiting_for_resource, preparing, pending, running,
+		// scheduled, waiting_for_callback
 		return CheckBucketPending
 	}
 }
@@ -166,42 +175,7 @@ func (job WorkflowJob) IsStatusInProgress() bool {
 
 func SortRuns(runs []WorkflowRun) {
 	sort.SliceStable(runs, func(i, j int) bool {
-		if runs[i].Bucket == CheckBucketFail &&
-			runs[j].Bucket != CheckBucketFail {
-			return true
-		}
-		if runs[j].Bucket == CheckBucketFail &&
-			runs[i].Bucket != CheckBucketFail {
-			return false
-		}
-
-		if runs[i].Bucket == CheckBucketPending &&
-			runs[j].Bucket != CheckBucketPending {
-			return true
-		}
-		if runs[j].Bucket == CheckBucketPending &&
-			runs[i].Bucket != CheckBucketPending {
-			return false
-		}
-
-		if runs[i].Bucket == CheckBucketSkipping &&
-			runs[j].Bucket != CheckBucketSkipping {
-			return true
-		}
-		if runs[j].Bucket == CheckBucketSkipping &&
-			runs[i].Bucket != CheckBucketSkipping {
-			return false
-		}
-
-		if runs[i].Bucket == CheckBucketNeutral &&
-			runs[j].Bucket != CheckBucketNeutral {
-			return true
-		}
-		if runs[j].Bucket == CheckBucketNeutral &&
-			runs[i].Bucket != CheckBucketNeutral {
-			return false
-		}
-
-		return strings.Compare(runs[i].Name, runs[j].Name) == -1
+		// newest pipeline first (higher IID)
+		return runs[i].RunNumber > runs[j].RunNumber
 	})
 }

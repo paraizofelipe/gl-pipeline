@@ -27,12 +27,12 @@ func (km keyMap) FullHelp() [][]key.Binding {
 		},
 		{
 			rerunKey,
+			playKey,
+			cancelKey,
 			openUrlKey,
-			openPRKey,
 			refreshAllKey,
 		},
 		{
-			modeKey,
 			quitKey,
 			helpKey,
 		},

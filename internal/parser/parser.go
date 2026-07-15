@@ -1,87 +1,122 @@
 package parser
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dlvhdr/gh-enhance/internal/api"
 	"github.com/dlvhdr/gh-enhance/internal/data"
-	"github.com/dlvhdr/gh-enhance/internal/tui/markdown"
 )
 
+// GitLab job traces delimit collapsible sections with control lines of the form
+//
+//	section_start:<unix_ts>:<section_name>\r\x1b[0K<header text>
+//	section_end:<unix_ts>:<section_name>\r\x1b[0K
+//
+// section names use only [A-Za-z0-9_.-]. The visible header follows the
+// `\r\x1b[0K` (carriage-return + erase-to-end-of-line) sequence.
+var sectionRe = regexp.MustCompile(
+	`section_(start|end):(\d+):([A-Za-z0-9_.\-]+)\r?(?:\x1b\[0?K)?`,
+)
+
+// eraseLineRe matches the standalone erase-to-end-of-line sequence that GitLab
+// sprinkles through traces; stripping it keeps colors intact while removing
+// cursor noise.
+var eraseLineRe = regexp.MustCompile(`\x1b\[0?K`)
+
+// Log markers referenced by the TUI log renderer. GitLab traces don't embed
+// these literal tokens (sections are stripped during parsing), so the renderer's
+// replacements against them are harmless no-ops kept for rendering symmetry.
 const (
-	StepStartMarker      = "##[group]Run "
-	GroupStartMarker     = "##[group]"
-	GroupEndMarker       = "##[endgroup]"
-	CommandMarker        = "[command]"
-	ErrorMarker          = "##[error]"
-	PostJobCleanupMarker = "Post job cleanup."
-	CompleteJobMarker    = "Cleaning up orphan processes"
+	GroupStartMarker = "##[group]"
+	CommandMarker    = "[command]"
+	ErrorMarker      = "##[error]"
 )
 
-func ParseJobLogs(jobLogs string) []data.LogsWithTime {
-	lines := strings.Lines(jobLogs)
-	stepsLogs := make([]data.LogsWithTime, 0)
+// ParseJobTrace parses a raw GitLab job trace into renderable log lines and the
+// list of trace sections (surfaced in the TUI as the equivalent of steps).
+func ParseJobTrace(trace string) ([]data.LogsWithTime, []api.Step) {
+	logs := make([]data.LogsWithTime, 0)
+	sections := make([]api.Step, 0)
 
+	// index of the open section in `sections`, by section name
+	open := make(map[string]int)
+	depth := 0
+	stepNumber := 0
 	var lastTime time.Time
-	var err error
-	var name, step string
-	count, depth := 0, 0
 
-	for line := range lines {
-		fields := strings.SplitN(line, string('\t'), 3)
+	for _, line := range strings.Split(trace, "\n") {
+		line = strings.TrimRight(line, "\r")
 
-		if count == 0 {
-			name = fields[0]
-			step = fields[1]
-		}
+		if m := sectionRe.FindStringSubmatch(line); m != nil {
+			kind := m[1]
+			ts, _ := strconv.ParseInt(m[2], 10, 64)
+			name := m[3]
+			at := time.Unix(ts, 0)
+			lastTime = at
 
-		if name != "" && step != "" {
-			line = strings.Replace(line, name+string('\t'), "", 1)
-			line = strings.Replace(line, step+string('\t'), "", 1)
-		}
+			// visible text after the marker (a header for section_start)
+			header := strings.TrimSpace(sectionRe.ReplaceAllString(line, ""))
+			header = eraseLineRe.ReplaceAllString(header, "")
 
-		dateAndLog := strings.SplitN(fields[2], " ", 2)
-		var lineDate time.Time
-		if len(dateAndLog) == 2 {
-			lineDate, err = time.Parse(time.RFC3339, dateAndLog[0])
-			if err == nil {
-				lastTime = lineDate
+			if kind == "start" {
+				depth++
+				stepNumber++
+				sections = append(sections, api.Step{
+					Name:      headerOrName(header, name),
+					Number:    stepNumber,
+					StartedAt: at,
+					Status:    api.StatusInProgress,
+				})
+				open[name] = len(sections) - 1
+				logs = append(logs, data.LogsWithTime{
+					Log:   headerOrName(header, name),
+					Time:  at,
+					Kind:  data.LogKindGroupStart,
+					Depth: depth,
+				})
 			} else {
-				lineDate = lastTime
+				if idx, ok := open[name]; ok {
+					sections[idx].CompletedAt = at
+					sections[idx].Status = api.StatusCompleted
+					sections[idx].Conclusion = api.ConclusionSuccess
+					delete(open, name)
+				}
+				logs = append(logs, data.LogsWithTime{Time: at, Kind: data.LogKindGroupEnd})
+				depth = max(0, depth-1)
 			}
-		} else {
-			lineDate = lastTime
+			continue
 		}
 
-		text := strings.Join(dateAndLog[1:], "")
-		log := data.LogsWithTime{Time: lineDate}
-		if strings.Contains(line, StepStartMarker) {
-			depth++
-			log.Kind = data.LogKindStepStart
-		} else if strings.Contains(line, GroupStartMarker) {
-			depth++
-			log.Kind = data.LogKindGroupStart
-		} else if strings.Contains(text, GroupEndMarker) {
-			depth = max(0, depth-1)
-			text = "\n"
-			log.Kind = data.LogKindGroupEnd
-		} else if strings.Contains(text, PostJobCleanupMarker) {
-			log.Kind = data.LogKindJobCleanup
-		} else if strings.Contains(text, CommandMarker) {
-			log.Kind = data.LogKindCommand
-		} else if strings.Contains(text, ErrorMarker) {
-			log.Kind = data.LogKindError
+		text := eraseLineRe.ReplaceAllString(line, "")
+		kind := data.LogKindStepNone
+		if isErrorLine(text) {
+			kind = data.LogKindError
 		}
-
-		log.Depth = depth
-		log.Log = strings.TrimRight(text, "\n")
-		stepsLogs = append(stepsLogs, log)
+		logs = append(logs, data.LogsWithTime{
+			Log:   strings.TrimRight(text, "\n"),
+			Time:  lastTime,
+			Kind:  kind,
+			Depth: depth,
+		})
 	}
 
-	return stepsLogs
+	return logs, sections
 }
 
-func ParseRunOutputMarkdown(output string, width int) (string, error) {
-	renderer := markdown.GetMarkdownRenderer(width)
-	return renderer.Render(output)
+func headerOrName(header, name string) string {
+	if header != "" {
+		return header
+	}
+	return name
+}
+
+func isErrorLine(text string) bool {
+	lower := strings.ToLower(text)
+	return strings.Contains(lower, "error:") ||
+		strings.HasPrefix(strings.TrimSpace(lower), "error ") ||
+		strings.Contains(text, "ERROR:") ||
+		strings.Contains(lower, "command terminated with")
 }

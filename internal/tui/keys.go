@@ -100,7 +100,17 @@ var (
 
 	rerunKey = key.NewBinding(
 		key.WithKeys("ctrl+r"),
-		key.WithHelp("ctrl+r", "rerun"),
+		key.WithHelp("ctrl+r", "retry"),
+	)
+
+	playKey = key.NewBinding(
+		key.WithKeys("p"),
+		key.WithHelp("p", "play manual job"),
+	)
+
+	cancelKey = key.NewBinding(
+		key.WithKeys("c"),
+		key.WithHelp("c", "cancel"),
 	)
 
 	helpKey = key.NewBinding(

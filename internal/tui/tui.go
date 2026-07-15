@@ -21,7 +21,6 @@ import (
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
 	"github.com/charmbracelet/x/ansi"
-	checks "github.com/dlvhdr/x/gh-checks"
 	help "github.com/dlvhdr/x/help"
 	tint "github.com/lrstanley/bubbletint/v2"
 
@@ -50,8 +49,11 @@ type model struct {
 	width             int
 	height            int
 	prNumber          string
-	repo              string
-	runID             string // set when viewing a run directly (no PR)
+	repo              string // GitLab project path (group/project)
+	runID             string // pipeline id, set once resolved
+	mrIID             int    // >0 => resolve the MR's latest pipeline
+	pipelineID        int64  // >0 => view this pipeline directly
+	ref               string // branch/tag => latest pipeline for the ref
 	pr                api.PR
 	prWithChecks      api.PRWithChecks
 	workflowRuns      []data.WorkflowRun
@@ -83,14 +85,22 @@ type model struct {
 }
 
 type ModelOpts struct {
-	Flat  bool
-	RunID string // non-empty when in run mode (no PR context)
+	Flat       bool
+	MRIID      int
+	PipelineID int64
+	Ref        string
+	Theme      string // bubbletint id; empty falls back to env/default
 }
 
 func NewModel(repo string, number string, opts ModelOpts) model {
 	tint.NewDefaultRegistry()
-	tint.SetTintID(tint.TintTokyoNightStorm.ID)
-	theme := os.Getenv("ENHANCE_THEME")
+	// Gruvbox Dark is the default theme. Precedence: --theme flag (opts.Theme)
+	// > GL_PIPELINE_THEME env > default. Any bubbletint id is accepted.
+	tint.SetTintID(tint.TintGruvboxDark.ID)
+	theme := opts.Theme
+	if theme == "" {
+		theme = os.Getenv("GL_PIPELINE_THEME")
+	}
 	if theme != "" {
 		tint.SetTintID(theme)
 	}
@@ -192,7 +202,9 @@ func NewModel(repo string, number string, opts ModelOpts) model {
 		checksList:        checksList,
 		prNumber:          number,
 		repo:              repo,
-		runID:             opts.RunID,
+		mrIID:             opts.MRIID,
+		pipelineID:        opts.PipelineID,
+		ref:               opts.Ref,
 		runsDelegate:      runsDelegate,
 		jobsDelegate:      jobsDelegate,
 		stepsDelegate:     stepsDelegate,
@@ -209,16 +221,17 @@ func NewModel(repo string, number string, opts ModelOpts) model {
 		focusedPane:       focusedPane,
 		lastFetched:       time.Now(),
 	}
+	if opts.PipelineID > 0 {
+		m.runID = fmt.Sprintf("%d", opts.PipelineID)
+	}
 	m.help.SetKeys(keys.FullHelp())
 	m.setFocusedPaneStyles()
 	return m
 }
 
 func (m model) Init() tea.Cmd {
-	if m.runID != "" {
-		return m.makeRunModeInitCmd()
-	}
-	return m.makeInitCmd()
+	// gl-pipeline always runs in pipeline (run) mode.
+	return m.makeRunModeInitCmd()
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -262,6 +275,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.workflowRuns = rmMsg.runs
+		if len(rmMsg.runs) > 0 {
+			m.runID = rmMsg.runs[0].Id
+		}
 		m.lastFetched = time.Now()
 		m.stopSpinners()
 		cmds = append(cmds, m.onWorkflowRunsFetched()...)
@@ -334,6 +350,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ji := m.getJobItemById(msg.jobId)
 		if ji != nil {
 			ji.logs = msg.logs
+			ji.steps = msg.steps
+			ji.loadingSteps = false
 			ji.logsErr = msg.err
 			ji.logsStderr = msg.stderr
 			ji.loadingLogs = false
@@ -372,7 +390,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.lastFetched = time.Now()
-		cmds = append(cmds, m.fetchPRChecksWithInterval())
+		cmds = append(cmds, m.fetchRunWithInterval())
 
 	case reRunRunMsg:
 		if msg.err != nil {
@@ -384,7 +402,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		m.lastFetched = time.Now()
-		cmds = append(cmds, m.fetchPRChecksWithInterval())
+		cmds = append(cmds, m.fetchRunWithInterval())
 
 	case tea.WindowSizeMsg:
 		log.Info("window size changed", "width", msg.Width, "height", msg.Height)
@@ -428,21 +446,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		if key.Matches(msg, modeKey) {
-			m.flat = !m.flat
-			if m.flat {
-				m.focusedPane = PaneChecks
-			} else {
-				m.focusedPane = PaneRuns
-			}
-			cmds = append(cmds, m.onWorkflowRunsFetched()...)
-			if m.flat {
-				cmds = append(cmds, m.onCheckChanged()...)
-			} else {
-				cmds = append(cmds, m.onRunChanged()...)
-			}
-		}
-
 		if key.Matches(msg, zoomPaneKey) {
 			if m.zoomedPane == nil {
 				m.zoomedPane = &m.focusedPane
@@ -453,8 +456,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key.Matches(msg, refreshAllKey) {
-			newModel := NewModel(m.repo, m.prNumber, ModelOpts{})
-			newModel.flat = m.flat
+			newModel := NewModel(m.repo, m.prNumber, ModelOpts{
+				MRIID:      m.mrIID,
+				PipelineID: m.pipelineID,
+				Ref:        m.ref,
+			})
 			newModel.focusedPane = m.focusedPane
 			newModel.width = m.width
 			newModel.height = m.height
@@ -464,7 +470,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			newModel.setFocusedPaneStyles()
 
 			m.lastFetched = time.Now()
-			return newModel, newModel.makeInitCmd()
+			return newModel, newModel.makeRunModeInitCmd()
 		}
 
 		if key.Matches(msg, rerunKey) {
@@ -486,6 +492,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					rid = ri.run.Id
 				}
 				cmds = append(cmds, m.rerunJob(rid, ji.job.Id)...)
+			}
+		}
+
+		if key.Matches(msg, playKey) {
+			ji := m.getSelectedJobItem()
+			if ji != nil && ji.job.IsManual {
+				cmds = append(cmds, m.playJob(ji.job.Id)...)
+			}
+		}
+
+		if key.Matches(msg, cancelKey) {
+			ri := m.getSelectedRunItem()
+			if m.focusedPane == PaneRuns && ri != nil {
+				cmds = append(cmds, m.cancelRun(ri.run.Id)...)
+			} else if ji := m.getSelectedJobItem(); ji != nil {
+				cmds = append(cmds, m.cancelJob(ji.job.Id)...)
 			}
 		}
 
@@ -884,7 +906,7 @@ func (m *model) viewRunModeHeader(bgStyle lipgloss.Style, logo string, logoWidth
 
 	if len(m.workflowRuns) == 0 {
 		title := bgStyle.Width(contentWidth).
-			Render(fmt.Sprintf("Loading %s run #%s...", m.repo, m.runID))
+			Render(fmt.Sprintf("Loading %s pipeline...", m.repo))
 		return m.styles.headerStyle.Width(m.width).Render(
 			lipgloss.JoinHorizontal(lipgloss.Left, bgStyle.Render(title), logo))
 	}
@@ -917,8 +939,11 @@ func (m *model) viewRunModeHeader(bgStyle lipgloss.Style, logo string, logoWidth
 
 	repoName := bgStyle.Foreground(m.styles.colors.darkColor).Bold(true).Render(m.repo)
 	separator := bgStyle.Foreground(m.styles.colors.faintColor).Render(" ⋅ ")
-	runIdText := bgStyle.Foreground(m.styles.colors.faintColor).Render(
-		fmt.Sprintf("run #%s", m.runID))
+	pipelineLabel := fmt.Sprintf("pipeline #%d", run.RunNumber)
+	if run.RunNumber == 0 {
+		pipelineLabel = fmt.Sprintf("pipeline %s", m.runID)
+	}
+	runIdText := bgStyle.Foreground(m.styles.colors.faintColor).Render(pipelineLabel)
 
 	topLine := bgStyle.Width(contentWidth).Render(lipgloss.JoinHorizontal(lipgloss.Top,
 		bgStyle.Render(status),
@@ -939,7 +964,7 @@ func (m *model) viewRunModeHeader(bgStyle lipgloss.Style, logo string, logoWidth
 	var bottomLine string
 	if run.PRNumber > 0 {
 		prLabel := bgStyle.Foreground(m.styles.colors.faintColor).Render(
-			fmt.Sprintf("#%d", run.PRNumber))
+			fmt.Sprintf("!%d", run.PRNumber))
 		bottomLine = bgStyle.Width(contentWidth).Render(
 			lipgloss.JoinHorizontal(lipgloss.Top,
 				bgStyle.Bold(true).Render(titleText),
@@ -981,7 +1006,7 @@ func (m *model) viewFooter() string {
 			fmt.Sprintf("%d checks: ", total))
 	}
 
-	stats := checks.AccumulatedStats(
+	stats := accumulatedStats(
 		contexts.CheckRunCountsByState,
 		contexts.StatusContextCountsByState,
 	)
@@ -1759,6 +1784,10 @@ func (m *model) logsContentView() string {
 		return m.fullScreenMessageView(
 			m.styles.faintFgStyle.Bold(true).Render("Nothing selected..."),
 		)
+	}
+
+	if ji.job.IsManual {
+		return m.noLogsView("This is a manual job — press p to play it")
 	}
 
 	if ji.job.Conclusion == api.ConclusionSkipped {

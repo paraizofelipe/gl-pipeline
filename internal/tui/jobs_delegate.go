@@ -47,7 +47,19 @@ func (i *jobItem) Title() string {
 }
 
 // Description implements charm.land/bubbles.list.DefaultItem.Description
+// It shows the job's stage (the GitLab grouping) alongside its status/timing.
 func (i *jobItem) Description() string {
+	status := i.statusText()
+	if i.job.Stage != "" {
+		return fmt.Sprintf("%s %s %s", i.job.Stage, Separator, status)
+	}
+	return status
+}
+
+func (i *jobItem) statusText() string {
+	if i.job.IsManual {
+		return "Manual"
+	}
 	if i.job.Bucket == data.CheckBucketSkipping {
 		return "Skipped"
 	}

@@ -12,14 +12,32 @@ import (
 
 // GitLab job traces delimit collapsible sections with control lines of the form
 //
-//	section_start:<unix_ts>:<section_name>\r\x1b[0K<header text>
+//	section_start:<unix_ts>:<section_name>[collapsed=true]\r\x1b[0K<header text>
 //	section_end:<unix_ts>:<section_name>\r\x1b[0K
 //
-// section names use only [A-Za-z0-9_.-]. The visible header follows the
-// `\r\x1b[0K` (carriage-return + erase-to-end-of-line) sequence.
+// section names use only [A-Za-z0-9_.-] plus an optional [key=value] suffix. The
+// visible header follows the `\r\x1b[0K` (carriage-return + erase-to-end-of-line)
+// sequence.
 var sectionRe = regexp.MustCompile(
-	`section_(start|end):(\d+):([A-Za-z0-9_.\-]+)\r?(?:\x1b\[0?K)?`,
+	`section_(start|end):(\d+):([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\r?(?:\x1b\[0?K)?`,
 )
+
+// markerNormalizeRe matches a section marker that is NOT already at the start of
+// a physical line — the transition case where GitLab packs the previous
+// section's `section_end` and the next `section_start` onto one line separated
+// only by `\r` (e.g. `…section_end:…\r\x1b[0Ksection_start:…\r\x1b[0Kheader`).
+// Requiring the trailing `\r` anchors the match to a genuine marker so log
+// content that merely mentions the words is never split. The captured leading
+// byte is preserved; a newline is inserted before the marker so the line-based
+// parser sees exactly one marker per line.
+var markerNormalizeRe = regexp.MustCompile(
+	`([^\n])(section_(?:start|end):[0-9]+:[A-Za-z0-9_.\-]+(?:\[[^\]]*\])?\r)`,
+)
+
+// ansiAllRe matches every ANSI CSI sequence, including SGR colors. It is used to
+// derive a plain-text section header for the step name (colors belong in the
+// log body, not in the list label).
+var ansiAllRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
 
 // eraseLineRe matches the standalone erase-to-end-of-line sequence that GitLab
 // sprinkles through traces; stripping it keeps colors intact while removing
@@ -47,6 +65,12 @@ func ParseJobTrace(trace string) ([]data.LogsWithTime, []api.Step) {
 	logs := make([]data.LogsWithTime, 0)
 	sections := make([]api.Step, 0)
 
+	// GitLab often emits a section's `section_end` and the next `section_start`
+	// on the same physical line (separated by `\r`). Put each marker on its own
+	// line first, so the line-based scan below sees them all instead of only the
+	// first one per line.
+	trace = markerNormalizeRe.ReplaceAllString(trace, "$1\n$2")
+
 	// index of the open section in `sections`, by section name
 	open := make(map[string]int)
 	depth := 0
@@ -70,8 +94,10 @@ func ParseJobTrace(trace string) ([]data.LogsWithTime, []api.Step) {
 			if kind == "start" {
 				depth++
 				stepNumber++
+				// the list label is plain text; the colored header stays in the log
+				label := strings.TrimSpace(ansiAllRe.ReplaceAllString(header, ""))
 				sections = append(sections, api.Step{
-					Name:      headerOrName(header, name),
+					Name:      headerOrName(label, name),
 					Number:    stepNumber,
 					StartedAt: at,
 					Status:    api.StatusInProgress,

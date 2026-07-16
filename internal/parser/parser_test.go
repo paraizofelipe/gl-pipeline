@@ -47,6 +47,49 @@ func TestParseJobTraceSections(t *testing.T) {
 	}
 }
 
+func TestParseJobTracePacksMarkersOnOneLine(t *testing.T) {
+	// Real GitLab traces pack a section's section_end and the next section_start
+	// onto a single physical line, separated only by \r. Colors also leak into
+	// the header. The parser must still surface every section with a plain name.
+	esc := "\x1b"
+	trace := "section_start:1700000000:prepare_executor\r" + esc + "[0K" + esc +
+		"[36;1mPreparing the \"kubernetes\" executor" + esc + "[0;m\n" +
+		"Using namespace foo\n" +
+		"section_end:1700000010:prepare_executor\r" + esc + "[0Ksection_start:1700000010:get_sources\r" +
+		esc + "[0K" + esc + "[36;1mGetting source from Git repository" + esc + "[0;m\n" +
+		"Fetching changes...\n" +
+		"section_end:1700000020:get_sources\r" + esc + "[0Ksection_start:1700000020:step_script\r" +
+		esc + "[0K" + esc + "[36;1mExecuting \"step_script\" stage" + esc + "[0;m\n" +
+		"make build\n" +
+		"section_end:1700000050:step_script\r" + esc + "[0K\n"
+
+	_, sections := ParseJobTrace(trace)
+
+	if len(sections) != 3 {
+		t.Fatalf("expected 3 sections, got %d", len(sections))
+	}
+	wantNames := []string{
+		"Preparing the \"kubernetes\" executor",
+		"Getting source from Git repository",
+		`Executing "step_script" stage`,
+	}
+	for i, want := range wantNames {
+		if sections[i].Name != want {
+			t.Errorf("section[%d].Name = %q, want %q", i, sections[i].Name, want)
+		}
+		if strings.Contains(sections[i].Name, "\x1b") {
+			t.Errorf("section[%d].Name leaked ANSI: %q", i, sections[i].Name)
+		}
+		if sections[i].CompletedAt.IsZero() {
+			t.Errorf("section[%d] (%s) was not closed", i, sections[i].Name)
+		}
+	}
+	if sections[2].StartedAt.Unix() != 1700000020 || sections[2].CompletedAt.Unix() != 1700000050 {
+		t.Errorf("step_script timing wrong: start=%d end=%d",
+			sections[2].StartedAt.Unix(), sections[2].CompletedAt.Unix())
+	}
+}
+
 func TestParseJobTraceCollapsesProgressBars(t *testing.T) {
 	// A pip-style progress bar redraws one physical line with \r frames.
 	trace := "0.0/5.5 MB ? eta -:--:--\r2.1/5.5 MB 6.8 MB/s\r5.5/5.5 MB 9.6 MB/s 0:00:01\n"

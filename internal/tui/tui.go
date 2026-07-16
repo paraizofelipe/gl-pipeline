@@ -75,6 +75,9 @@ type model struct {
 	logsSpinner       spinner.Model
 	logsInput         textinput.Model
 	inProgressSpinner spinner.Model
+	itemSpinner       spinner.Model // single shared animation clock for all rows
+	animating         bool          // true while any job is running
+	itemSpinnerOn     bool          // whether the shared spinner loop is alive
 	flat              bool
 	lastTick          time.Time
 	version           string
@@ -184,6 +187,8 @@ func NewModel(repo string, number string, opts ModelOpts) model {
 	ips := spinner.New(spinner.WithSpinner(InProgressFrames))
 	ips.Style = lipgloss.NewStyle().Foreground(s.colors.warnColor)
 
+	itemSpin := NewClockSpinner(s)
+
 	h := help.New()
 	h.Styles.FullKey = lipgloss.NewStyle().Foreground(s.colors.lightColor)
 	h.Styles.FullDesc = lipgloss.NewStyle().Foreground(s.tint.BrightWhite)
@@ -217,6 +222,7 @@ func NewModel(repo string, number string, opts ModelOpts) model {
 		help:              h,
 		version:           version,
 		inProgressSpinner: ips,
+		itemSpinner:       itemSpin,
 		flat:              opts.Flat,
 		focusedPane:       focusedPane,
 		lastFetched:       time.Now(),
@@ -277,6 +283,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.workflowRuns = rmMsg.runs
 		if len(rmMsg.runs) > 0 {
 			m.runID = rmMsg.runs[0].Id
+		}
+		m.animating = anyRunning(m.workflowRuns)
+		if m.animating && !m.itemSpinnerOn {
+			m.itemSpinnerOn = true
+			cmds = append(cmds, m.itemSpinner.Tick)
 		}
 		m.lastFetched = time.Now()
 		m.stopSpinners()
@@ -537,42 +548,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case spinner.TickMsg:
-		checks := m.checksList.Items()
-		for _, run := range checks {
-			ci := run.(*checkItem)
-			if ci != nil && ci.isStatusInProgress() {
-				ci.spinner, cmd = ci.spinner.Update(msg)
-				cmds = append(cmds, cmd)
-			}
+		// Single shared animation clock for every in-progress row. Previously
+		// each item owned a spinner and armed its own tick loop; with dozens of
+		// running jobs that produced a tick storm that flooded Update+View and
+		// made navigation lag. Now one spinner advances and its frame is pushed
+		// to every row via the delegates.
+		m.itemSpinner, cmd = m.itemSpinner.Update(msg)
+		m.setDelegateSpinner(m.itemSpinner.View())
+		if m.animating {
+			cmds = append(cmds, cmd) // keep the single loop alive
+		} else {
+			m.itemSpinnerOn = false
 		}
 
-		runs := m.runsList.Items()
-		for _, run := range runs {
-			ri := run.(*runItem)
-			if ri != nil && ri.IsInProgress() {
-				ri.spinner, cmd = ri.spinner.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-		}
-
-		jobs := m.jobsList.Items()
-		for _, job := range jobs {
-			ji := job.(*jobItem)
-			if ji != nil && ji.isStatusInProgress() {
-				ji.spinner, cmd = ji.spinner.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-		}
-
-		steps := m.stepsList.Items()
-		for _, step := range steps {
-			si := step.(*stepItem)
-			if si != nil && si.IsInProgress() {
-				si.spinner, cmd = si.spinner.Update(msg)
-				cmds = append(cmds, cmd)
-			}
-		}
-
+		// Log-area spinners for the selected job (bounded: at most one each).
 		ji := m.getSelectedJobItem()
 		if ji == nil || ji.loadingLogs {
 			m.logsSpinner, cmd = m.logsSpinner.Update(msg)
@@ -582,17 +571,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
-		ci := m.getSelectedCheckItem()
-		if ci == nil || ci.loadingLogs {
-			m.logsSpinner, cmd = m.logsSpinner.Update(msg)
-			cmds = append(cmds, cmd)
-		} else if ci.isStatusInProgress() {
-			m.inProgressSpinner, cmd = m.inProgressSpinner.Update(msg)
-			cmds = append(cmds, cmd)
-		}
-
-		m.checksList, cmd = m.checksList.Update(msg)
-		cmds = append(cmds, cmd)
+		// Advance whichever list loading-spinner this tick belongs to (O(1)).
 		m.runsList, cmd = m.runsList.Update(msg)
 		cmds = append(cmds, cmd)
 		m.jobsList, cmd = m.jobsList.Update(msg)
@@ -2243,6 +2222,35 @@ func (m *model) stopSpinners() {
 	m.checksList.StopSpinner()
 	m.runsList.StopSpinner()
 	m.jobsList.StopSpinner()
+}
+
+// setDelegateSpinner pushes the current shared-spinner frame to every list
+// delegate, so all in-progress rows animate from a single ticker.
+func (m *model) setDelegateSpinner(frame string) {
+	if d, ok := m.runsDelegate.(*runsDelegate); ok {
+		d.spinnerView = frame
+	}
+	if d, ok := m.jobsDelegate.(*jobsDelegate); ok {
+		d.spinnerView = frame
+	}
+	if d, ok := m.stepsDelegate.(*stepsDelegate); ok {
+		d.spinnerView = frame
+	}
+	if d, ok := m.checksDelegate.(*checksDelegate); ok {
+		d.spinnerView = frame
+	}
+}
+
+// anyRunning reports whether any job has started but not finished.
+func anyRunning(runs []data.WorkflowRun) bool {
+	for _, r := range runs {
+		for _, j := range r.Jobs {
+			if !j.StartedAt.IsZero() && j.CompletedAt.IsZero() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *model) resetStepsState() {

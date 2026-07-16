@@ -7,7 +7,6 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/list"
-	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
@@ -33,7 +32,6 @@ type jobItem struct {
 	loadingLogs        bool
 	loadingSteps       bool
 	steps              []*stepItem
-	spinner            spinner.Model
 	styles             styles
 }
 
@@ -88,7 +86,7 @@ func (i *jobItem) FilterValue() string {
 func (i *jobItem) viewStatus() string {
 	s := i.meta.TitleStyle()
 	if i.job.CompletedAt.IsZero() && !i.job.StartedAt.IsZero() {
-		return i.spinner.View()
+		return i.meta.spinnerView
 	}
 	return bucketToIcon(i.job.Bucket, s, i.meta.styles)
 }
@@ -153,13 +151,8 @@ func (ji *jobItem) hasInProgressSteps() bool {
 	return false
 }
 
-func (ji *jobItem) Tick() tea.Cmd {
-	if ji.isStatusInProgress() {
-		return ji.spinner.Tick
-	}
-
-	return nil
-}
+// Tick is a no-op; a single shared model spinner drives row animation.
+func (ji *jobItem) Tick() tea.Cmd { return nil }
 
 func NewJobItem(job data.WorkflowJob, styles styles) jobItem {
 	loadingSteps := job.Kind == data.JobKindGithubActions
@@ -170,6 +163,5 @@ func NewJobItem(job data.WorkflowJob, styles styles) jobItem {
 		loadingLogs:  false,
 		loadingSteps: loadingSteps,
 		steps:        make([]*stepItem, 0),
-		spinner:      NewClockSpinner(styles),
 	}
 }

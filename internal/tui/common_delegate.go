@@ -10,10 +10,11 @@ import (
 )
 
 type itemMeta struct {
-	focused  bool
-	selected bool
-	styles   styles
-	width    int
+	focused     bool
+	selected    bool
+	styles      styles
+	width       int
+	spinnerView string // current frame of the shared item-animation spinner
 }
 
 func (i itemMeta) TitleStyle() lipgloss.Style {
@@ -42,8 +43,9 @@ func (i itemMeta) DescStyle() lipgloss.Style {
 
 // commonDelegate partially implements charm.land/bubbles.list.ItemDelegate
 type commonDelegate struct {
-	focused bool
-	styles  styles
+	focused     bool
+	styles      styles
+	spinnerView string // pushed to each item on render (single shared spinner)
 }
 
 func (d *commonDelegate) Render(
@@ -57,6 +59,7 @@ func (d *commonDelegate) Render(
 	meta.focused = d.focused
 	meta.selected = isSelected
 	meta.width = m.Width()
+	meta.spinnerView = d.spinnerView
 
 	var title, desc string
 

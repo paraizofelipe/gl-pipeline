@@ -6,7 +6,6 @@ import (
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/list"
-	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"charm.land/log/v2"
@@ -21,7 +20,6 @@ type runItem struct {
 	run       *data.WorkflowRun
 	jobsItems []*jobItem
 	loading   bool
-	spinner   spinner.Model
 }
 
 // Title implements /charm.land/bubbles.list.DefaultItem.Title
@@ -68,19 +66,15 @@ func (i *runItem) viewStatus() string {
 	s := i.meta.TitleStyle()
 
 	if i.IsInProgress() {
-		return i.spinner.View()
+		return i.meta.spinnerView
 	}
 
 	return bucketToIcon(i.run.Bucket, s, i.meta.styles)
 }
 
-func (ri *runItem) Tick() tea.Cmd {
-	if ri.IsInProgress() {
-		return ri.spinner.Tick
-	}
-
-	return nil
-}
+// Tick is retained for call-site compatibility; animation is now driven by a
+// single shared spinner on the model, so per-item ticks are a no-op.
+func (ri *runItem) Tick() tea.Cmd { return nil }
 
 // runsDelegate implements list.ItemDelegate
 type runsDelegate struct {
@@ -149,6 +143,5 @@ func NewRunItem(run data.WorkflowRun, styles styles) runItem {
 		run:       &run,
 		jobsItems: jobs,
 		loading:   true,
-		spinner:   NewClockSpinner(styles),
 	}
 }

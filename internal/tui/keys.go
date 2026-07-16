@@ -113,6 +113,11 @@ var (
 		key.WithHelp("c", "cancel"),
 	)
 
+	streamKey = key.NewBinding(
+		key.WithKeys("s"),
+		key.WithHelp("s", "stream logs"),
+	)
+
 	helpKey = key.NewBinding(
 		key.WithKeys("?"),
 		key.WithHelp("?", "toggle help"),

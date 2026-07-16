@@ -246,12 +246,19 @@ func (m *model) makeFetchJobLogsCmd() tea.Cmd {
 	if ji == nil {
 		return nil
 	}
-	if ji.isStatusInProgress() || ji.job.IsManual {
+	// Normally we don't fetch the trace of an in-progress (or manual) job — there
+	// is nothing final to show. Streaming (triggered by `s`) deliberately bypasses
+	// this so the live trace is polled while the job runs.
+	if !ji.streaming && (ji.isStatusInProgress() || ji.job.IsManual) {
 		return nil
 	}
 
-	log.Info("fetching job trace", "job", ji.job.Name)
-	ji.loadingLogs = true
+	log.Info("fetching job trace", "job", ji.job.Name, "streaming", ji.streaming)
+	// Only show the loading spinner on the first fetch; while streaming we keep
+	// the current logs on screen and swap them in when the refresh returns.
+	if !ji.streaming || len(ji.renderedLogs) == 0 {
+		ji.loadingLogs = true
+	}
 	ji.initiatedLogsFetch = true
 	jobID := ji.job.Id
 	jobLink := ji.job.Link

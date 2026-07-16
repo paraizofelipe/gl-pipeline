@@ -373,10 +373,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			ji.logsErr = msg.err
 			ji.logsStderr = msg.stderr
 			ji.loadingLogs = false
+			// Fresh trace arrived: drop the cached render so renderJobLogs
+			// recomputes from the new logs (critical for the streaming tail,
+			// which otherwise would keep showing the first snapshot).
+			ji.renderedLogs = nil
+			ji.unstyledLogs = nil
+			wasStreaming := ji.streaming
+			// Once the job ends we've just captured its final trace, so streaming
+			// turns itself off and the logs stay on screen as a normal result.
+			if ji.streaming && !ji.isStatusInProgress() {
+				ji.streaming = false
+			}
 			currJob := m.getSelectedJobItem()
 			if currJob != nil && currJob.job.Id == msg.jobId {
 				cmds = append(cmds, m.renderJobLogs())
-				m.goToErrorInLogs()
+				if wasStreaming {
+					m.logsViewport.GotoBottom()
+				} else {
+					m.goToErrorInLogs()
+				}
 			}
 
 			cmds = append(cmds, m.updateLists()...)
@@ -526,6 +541,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.cancelRun(ri.run.Id)...)
 			} else if ji := m.getSelectedJobItem(); ji != nil {
 				cmds = append(cmds, m.cancelJob(ji.job.Id)...)
+			}
+		}
+
+		if key.Matches(msg, streamKey) &&
+			(m.focusedPane == PaneJobs || m.focusedPane == PaneLogs) {
+			if ji := m.getSelectedJobItem(); ji != nil && ji.isStatusInProgress() {
+				ji.streaming = !ji.streaming
+				if ji.streaming {
+					// start streaming now instead of waiting for the next cycle;
+					// subsequent refreshes ride the shared 15s status loop.
+					log.Info("streaming logs", "job", ji.job.Name)
+					cmds = append(cmds, m.makeFetchJobLogsCmd(), m.renderJobLogs())
+				} else {
+					log.Info("stopped streaming logs", "job", ji.job.Name)
+					cmds = append(cmds, m.renderJobLogs())
+				}
 			}
 		}
 
@@ -1718,7 +1749,7 @@ func (m *model) renderJobLogs() tea.Cmd {
 		return nil
 	}
 
-	if ji.isStatusInProgress() {
+	if ji.isStatusInProgress() && !ji.streaming {
 		return m.inProgressSpinner.Tick
 	}
 
@@ -1780,7 +1811,7 @@ func (m *model) logsContentView() string {
 		return m.noLogsView("This job was skipped")
 	}
 
-	if ji.isStatusInProgress() {
+	if ji.isStatusInProgress() && !ji.streaming {
 		text := ""
 		if ji.job.State == api.StatusWaiting && ji.job.PendingEnv != "" {
 			text = lipgloss.NewStyle().Foreground(
@@ -1791,7 +1822,7 @@ func (m *model) logsContentView() string {
 		}
 
 		return m.fullScreenMessageView(
-			m.renderFullScreenLogsSpinner(text, "view the job on github.com"),
+			m.renderFullScreenLogsSpinner(text, "s", "stream the live logs"),
 		)
 	}
 
@@ -1813,7 +1844,7 @@ func (m *model) logsContentView() string {
 
 	if ji.logsErr != nil && strings.Contains(ji.logsStderr, "is still in progress;") {
 		return m.fullScreenMessageView(m.renderFullScreenLogsSpinner(
-			"This run is still in progress", "view the run on github.com"))
+			"This run is still in progress", "o", "view the run on github.com"))
 	}
 
 	if m.isScrollbarVisible() {
@@ -2049,7 +2080,7 @@ func (m *model) setWidths() {
 	m.logsInput.SetWidth(w - 10)
 }
 
-func (m *model) renderFullScreenLogsSpinner(message string, cta string) string {
+func (m *model) renderFullScreenLogsSpinner(message, keyHint, cta string) string {
 	return lipgloss.JoinVertical(
 		lipgloss.Center,
 		lipgloss.JoinHorizontal(lipgloss.Center,
@@ -2057,10 +2088,10 @@ func (m *model) renderFullScreenLogsSpinner(message string, cta string) string {
 			"  ",
 			lipgloss.NewStyle().Foreground(m.styles.colors.warnColor).Render(message)),
 		"",
-		m.styles.faintFgStyle.Render("(logs will be available when it is complete)"),
+		m.styles.faintFgStyle.Render("(refreshing every 15s while it runs)"),
 		"",
 		lipgloss.JoinHorizontal(lipgloss.Top, m.styles.faintFgStyle.Render("Press "),
-			m.styles.keyStyle.Render("o"),
+			m.styles.keyStyle.Render(keyHint),
 			m.styles.faintFgStyle.Render(" to "),
 			m.styles.faintFgStyle.Render(cta)),
 	)
@@ -2115,8 +2146,15 @@ func (m *model) onWorkflowRunsFetched() []tea.Cmd {
 		}
 
 		currJob := m.getSelectedJobItem()
-		if currJob != nil && !currJob.initiatedLogsFetch {
-			cmds = append(cmds, m.logsSpinner.Tick, m.makeFetchJobLogsCmd())
+		if currJob != nil {
+			if !currJob.initiatedLogsFetch {
+				cmds = append(cmds, m.logsSpinner.Tick, m.makeFetchJobLogsCmd())
+			} else if currJob.streaming {
+				// live tail: refetch the trace on every status-refresh cycle. This
+				// also captures the final trace once the job concludes, after which
+				// the fetch handler clears the streaming flag.
+				cmds = append(cmds, m.makeFetchJobLogsCmd())
+			}
 		}
 	}
 

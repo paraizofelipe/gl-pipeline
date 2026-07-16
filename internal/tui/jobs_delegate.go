@@ -31,6 +31,10 @@ type jobItem struct {
 	initiatedLogsFetch bool
 	loadingLogs        bool
 	loadingSteps       bool
+	// streaming is set when the user presses `s` on an in-progress job: instead
+	// of showing the spinner, the job trace is refetched on every status-refresh
+	// cycle and rendered live. It is cleared automatically once the job ends.
+	streaming bool
 	steps              []*stepItem
 	styles             styles
 }

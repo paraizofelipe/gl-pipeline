@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"time"
 
@@ -110,28 +111,19 @@ func (m *model) makeFetchRunCmd() tea.Cmd {
 	}
 }
 
-// fetchRun resolves the target pipeline (from a pipeline id, a merge request, or
-// the latest pipeline for a ref) and loads its jobs.
-func (m *model) fetchRun() tea.Msg {
-	pid := m.pipelineID
+// maxPipelineHistory bounds how many of an MR's pipelines are loaded (newest
+// first), to keep the number of per-pipeline job requests reasonable.
+const maxPipelineHistory = 20
 
-	if pid == 0 && m.mrIID > 0 {
-		pipelines, err := api.ListMRPipelines(m.repo, m.mrIID)
-		if err != nil {
-			return runModeFetchedMsg{err: err}
-		}
-		if len(pipelines) == 0 {
-			return runModeFetchedMsg{err: errors.New("merge request has no pipeline yet")}
-		}
-		latest := pipelines[0]
-		for _, p := range pipelines[1:] {
-			if p.ID > latest.ID {
-				latest = p
-			}
-		}
-		pid = latest.ID
+// fetchRun resolves the target(s) and loads their jobs. In MR mode it returns
+// every pipeline of the merge request (newest first); otherwise a single
+// pipeline (by id, or the latest for a ref).
+func (m *model) fetchRun() tea.Msg {
+	if m.pipelineID == 0 && m.mrIID > 0 {
+		return m.fetchMRPipelines()
 	}
 
+	pid := m.pipelineID
 	if pid == 0 {
 		p, err := api.GetLatestPipeline(m.repo, m.ref)
 		if err != nil {
@@ -152,6 +144,39 @@ func (m *model) fetchRun() tea.Msg {
 	run := buildPipelineRun(pipeline, jobs)
 	run.PRNumber = m.mrIID
 	return runModeFetchedMsg{runs: []data.WorkflowRun{run}}
+}
+
+// fetchMRPipelines loads every pipeline attached to the merge request (capped
+// and sorted newest first) along with each pipeline's jobs.
+func (m *model) fetchMRPipelines() tea.Msg {
+	pipelines, err := api.ListMRPipelines(m.repo, m.mrIID)
+	if err != nil {
+		return runModeFetchedMsg{err: err}
+	}
+	if len(pipelines) == 0 {
+		return runModeFetchedMsg{err: errors.New("merge request has no pipeline yet")}
+	}
+
+	// newest first, then cap to bound the number of job requests
+	sort.Slice(pipelines, func(i, j int) bool { return pipelines[i].ID > pipelines[j].ID })
+	if len(pipelines) > maxPipelineHistory {
+		pipelines = pipelines[:maxPipelineHistory]
+	}
+
+	runs := make([]data.WorkflowRun, 0, len(pipelines))
+	for _, p := range pipelines {
+		jobs, err := api.ListPipelineJobs(m.repo, p.ID)
+		if err != nil {
+			// Don't fail the whole history because one pipeline's jobs errored.
+			log.Error("error listing jobs for pipeline", "pipeline", p.ID, "err", err)
+			jobs = nil
+		}
+		run := buildPipelineRun(p, jobs)
+		run.PRNumber = m.mrIID
+		runs = append(runs, run)
+	}
+	data.SortRuns(runs)
+	return runModeFetchedMsg{runs: runs}
 }
 
 func buildPipelineRun(p api.Pipeline, jobs []api.Job) data.WorkflowRun {

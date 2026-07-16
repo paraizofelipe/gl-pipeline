@@ -113,9 +113,9 @@ func NewModel(repo string, number string, opts ModelOpts) model {
 	s := makeStyles()
 
 	runsList, runsDelegate := newRunsDefaultList(s)
-	runsList.Title = makePill(ListSymbol+" Runs", s.focusedPaneTitleStyle,
+	runsList.Title = makePill(ListSymbol+" Pipelines", s.focusedPaneTitleStyle,
 		s.colors.focusedColor)
-	runsList.SetStatusBarItemName("run", "runs")
+	runsList.SetStatusBarItemName("pipeline", "pipelines")
 	runsList.SetWidth(focusedLargePaneWidth)
 
 	jobsList, jobsDelegate := newJobsDefaultList(s)
@@ -1962,10 +1962,10 @@ func (m *model) getPaneTitle(l *list.Model) string {
 					m.styles.colors.focusedColor), s.Render(" > Steps"))
 		case PaneRuns:
 			return lipgloss.JoinHorizontal(lipgloss.Top,
-				makePill(s.Bold(true).Render("Runs"), l.Styles.Title,
+				makePill(s.Bold(true).Render("Pipelines"), l.Styles.Title,
 					m.styles.colors.focusedColor), s.Render(" > Jobs > Steps"))
 		case PaneJobs:
-			return lipgloss.JoinHorizontal(lipgloss.Top, s.Render("Runs > "),
+			return lipgloss.JoinHorizontal(lipgloss.Top, s.Render("Pipelines > "),
 				makePill(s.Bold(true).Render("Jobs"), l.Styles.Title,
 					m.styles.colors.focusedColor), s.Render(" > Steps"))
 		case PaneSteps:
@@ -1982,7 +1982,7 @@ func (m *model) getPaneTitle(l *list.Model) string {
 			}
 			return lipgloss.JoinHorizontal(
 				lipgloss.Top,
-				s.Render("Runs > Jobs > "),
+				s.Render("Pipelines > Jobs > "),
 				makePill(
 					s.Bold(true).Render("Steps"),
 					l.Styles.Title,

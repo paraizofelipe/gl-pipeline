@@ -223,6 +223,9 @@ func ListMRPipelines(project string, mrIID int) ([]Pipeline, error) {
 			Source:    p.Source,
 			WebURL:    p.WebURL,
 			CreatedAt: deref(p.CreatedAt),
+			// PipelineInfo carries no started_at; use created_at so the run
+			// list has a sensible timestamp to display.
+			StartedAt: deref(p.CreatedAt),
 			MRIID:     mrIID,
 		})
 	}

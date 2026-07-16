@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/dlvhdr/gh-enhance/internal/data"
+	"github.com/dlvhdr/gh-enhance/internal/utils"
 )
 
 type runItem struct {
@@ -33,15 +34,21 @@ func (i *runItem) Title() string {
 }
 
 // Description implements /charm.land/bubbles.list.DefaultItem.Description
+// Shows the pipeline source and, when known, how long ago it started — useful
+// when the pane lists the full pipeline history of a merge request.
 func (i *runItem) Description() string {
-	if i.run.Event == "" {
-		if i.run.Workflow == "" {
-			return "status check"
-		}
-		return i.run.Workflow
+	src := i.run.Event
+	if src == "" {
+		src = i.run.Workflow
+	}
+	if src == "" {
+		src = "pipeline"
 	}
 
-	return fmt.Sprintf("on: %s", i.run.Event)
+	if !i.run.StartedAt.IsZero() {
+		return fmt.Sprintf("%s %s %s", src, Separator, utils.FormatTimeSince(i.run.StartedAt))
+	}
+	return src
 }
 
 // FilterValue implements /charm.land/bubbles.list.Item.FilterValue

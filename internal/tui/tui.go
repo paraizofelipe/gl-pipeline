@@ -1720,21 +1720,30 @@ func (m *model) onJobChanged() []tea.Cmd {
 func (m *model) onStepChanged() {
 	ji := m.getSelectedJobItem()
 	step := m.stepsList.SelectedItem()
-	cursor := m.stepsList.Cursor()
 
 	if ji == nil || step == nil {
 		return
 	}
+	si := step.(*stepItem)
 
-	if cursor == len(m.stepsList.Items())-1 {
+	if m.stepsList.GlobalIndex() == len(m.stepsList.Items())-1 {
 		m.logsViewport.GotoBottom()
 		return
 	}
 
+	// Scroll so the selected step's first line (its section header) sits at the
+	// top. Match by order, not timestamp: the k-th group-start line in the log
+	// stream is the step numbered k. Timestamps are second-granular and adjacent
+	// sections often share a second, so a time-based lookup lands on the wrong
+	// step. renderLogs is 1:1 with ji.logs, so the log index is the line offset.
+	seen := 0
 	for i, log := range ji.logs {
-		if log.Time.After(step.(*stepItem).step.StartedAt) {
-			m.logsViewport.SetYOffset(i - 1)
-			return
+		if log.Kind == data.LogKindGroupStart {
+			seen++
+			if seen == si.step.Number {
+				m.logsViewport.SetYOffset(i)
+				return
+			}
 		}
 	}
 }

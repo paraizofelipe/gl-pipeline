@@ -26,6 +26,12 @@ var sectionRe = regexp.MustCompile(
 // cursor noise.
 var eraseLineRe = regexp.MustCompile(`\x1b\[0?K`)
 
+// ansiControlRe matches ANSI CSI sequences for cursor movement, erasing and
+// mode toggles (final bytes A-H, J, K, S, T, f, n, h, l) but deliberately NOT
+// SGR color sequences (final byte 'm'), so colors survive while cursor noise
+// that would corrupt the layout is removed.
+var ansiControlRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-HJKSTfnhl]`)
+
 // Log markers referenced by the TUI log renderer. GitLab traces don't embed
 // these literal tokens (sections are stripped during parsing), so the renderer's
 // replacements against them are harmless no-ops kept for rendering symmetry.
@@ -90,7 +96,16 @@ func ParseJobTrace(trace string) ([]data.LogsWithTime, []api.Step) {
 			continue
 		}
 
-		text := eraseLineRe.ReplaceAllString(line, "")
+		// Collapse carriage-return overwrites: progress bars redraw the same
+		// physical line with \r, so only the content after the last \r is what a
+		// terminal would ultimately show. Left in, a \r resets the cursor to
+		// screen column 0 and the text bleeds across the other panes.
+		if i := strings.LastIndex(line, "\r"); i >= 0 {
+			line = line[i+1:]
+		}
+
+		text := ansiControlRe.ReplaceAllString(line, "")
+		text = eraseLineRe.ReplaceAllString(text, "")
 		kind := data.LogKindStepNone
 		if isErrorLine(text) {
 			kind = data.LogKindError

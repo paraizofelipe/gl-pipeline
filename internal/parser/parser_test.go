@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dlvhdr/gh-enhance/internal/data"
@@ -43,6 +44,38 @@ func TestParseJobTraceSections(t *testing.T) {
 	}
 	if groupStarts != 2 {
 		t.Errorf("expected 2 group-start log lines, got %d", groupStarts)
+	}
+}
+
+func TestParseJobTraceCollapsesProgressBars(t *testing.T) {
+	// A pip-style progress bar redraws one physical line with \r frames.
+	trace := "0.0/5.5 MB ? eta -:--:--\r2.1/5.5 MB 6.8 MB/s\r5.5/5.5 MB 9.6 MB/s 0:00:01\n"
+	logs, _ := ParseJobTrace(trace)
+	if len(logs) == 0 {
+		t.Fatal("expected a log line")
+	}
+	got := logs[0].Log
+	if strings.ContainsRune(got, '\r') {
+		t.Errorf("carriage return leaked into output: %q", got)
+	}
+	if got != "5.5/5.5 MB 9.6 MB/s 0:00:01" {
+		t.Errorf("expected only the final progress frame, got %q", got)
+	}
+}
+
+func TestParseJobTraceKeepsColorsStripsCursor(t *testing.T) {
+	// green "ok" wrapped in SGR, preceded by a cursor-column control sequence.
+	trace := "\x1b[1G\x1b[32mok\x1b[0m done\n"
+	logs, _ := ParseJobTrace(trace)
+	if len(logs) == 0 {
+		t.Fatal("expected a log line")
+	}
+	got := logs[0].Log
+	if strings.Contains(got, "\x1b[1G") {
+		t.Errorf("cursor-move sequence not stripped: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[32m") || !strings.Contains(got, "\x1b[0m") {
+		t.Errorf("SGR color sequences should be preserved, got %q", got)
 	}
 }
 

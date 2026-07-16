@@ -19,7 +19,7 @@ import (
 	"github.com/dlvhdr/gh-enhance/internal/utils"
 )
 
-var refreshInterval = time.Second * 10
+var refreshInterval = time.Second * 15
 
 // --- Message types (some retained for dormant PR-mode Update cases) ---
 
@@ -33,8 +33,6 @@ type workflowRunsFetchedMsg struct {
 type prChecksIntervalTickMsg struct{ msg tea.Msg }
 
 type startIntervalFetching struct{}
-
-type startRunIntervalFetching struct{}
 
 type prFetchedMsg struct {
 	pr  api.PR
@@ -96,12 +94,12 @@ func (m *model) startSpinners() []tea.Cmd {
 }
 
 // makeRunModeInitCmd starts spinners and kicks off the pipeline fetch loop.
+// The periodic refresh is self-sustaining: each fetched result re-arms the next
+// tick from the Update handler (see scheduleRunRefetch), so init only needs to
+// trigger the first fetch.
 func (m *model) makeRunModeInitCmd() tea.Cmd {
 	cmds := m.startSpinners()
-	cmds = append(cmds,
-		m.makeFetchRunCmd(),
-		m.startFetchingRunWithInterval(),
-	)
+	cmds = append(cmds, m.makeFetchRunCmd())
 	return tea.Batch(cmds...)
 }
 
@@ -218,22 +216,26 @@ func buildPipelineRun(p api.Pipeline, jobs []api.Job) data.WorkflowRun {
 	}
 }
 
-func (m *model) startFetchingRunWithInterval() tea.Cmd {
+// scheduleRunRefetch arms a single delayed refetch of the pipeline. The Update
+// handler calls this after every fetched result while the pipeline is still in
+// progress, forming a self-sustaining loop that stops on its own once the
+// pipeline concludes. The guard lives in the handler (on the up-to-date model),
+// not in this closure, so it never fires against a stale snapshot.
+func (m *model) scheduleRunRefetch() tea.Cmd {
 	return tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
-		return startRunIntervalFetching{}
+		return runModeIntervalTickMsg{msg: m.fetchRun()}
 	})
 }
 
+// fetchRunWithInterval refetches immediately and unconditionally arms one more
+// refetch. It is used right after a mutation (retry/play/cancel): the server may
+// not have transitioned the job yet, so we cannot trust the current in-progress
+// state — we always schedule at least one follow-up, and the handler takes over
+// the loop from there.
 func (m *model) fetchRunWithInterval() tea.Cmd {
 	return tea.Batch(
 		m.makeFetchRunCmd(),
-		tea.Tick(refreshInterval, func(t time.Time) tea.Msg {
-			if !m.isRunModeInProgress() {
-				log.Info("pipeline has concluded - not refetching anymore")
-				return nil
-			}
-			return runModeIntervalTickMsg{msg: m.fetchRun()}
-		}),
+		m.scheduleRunRefetch(),
 	)
 }
 

@@ -169,8 +169,18 @@ func SortJobs(jobs []WorkflowJob) {
 	})
 }
 
+// IsStatusInProgress reports whether the job is in any non-terminal lifecycle
+// state — running, but also pending/queued/waiting. The TUI uses this single
+// definition to decide whether to keep auto-refreshing and to show the footer
+// countdown, so it must match the states that render a spinner.
 func (job WorkflowJob) IsStatusInProgress() bool {
-	return job.State == api.StatusInProgress
+	switch job.State {
+	case api.StatusInProgress, api.StatusPending, api.StatusQueued,
+		api.StatusWaiting, api.StatusRequested:
+		return true
+	default:
+		return false
+	}
 }
 
 func SortRuns(runs []WorkflowRun) {

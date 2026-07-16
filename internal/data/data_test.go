@@ -1,6 +1,29 @@
 package data
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/dlvhdr/gh-enhance/internal/api"
+)
+
+func TestIsStatusInProgress(t *testing.T) {
+	inProgress := []api.Status{
+		api.StatusInProgress, api.StatusPending, api.StatusQueued,
+		api.StatusWaiting, api.StatusRequested,
+	}
+	for _, s := range inProgress {
+		if !(WorkflowJob{State: s}).IsStatusInProgress() {
+			t.Errorf("IsStatusInProgress(%q) = false, want true", s)
+		}
+	}
+
+	terminal := []api.Status{api.StatusCompleted}
+	for _, s := range terminal {
+		if (WorkflowJob{State: s}).IsStatusInProgress() {
+			t.Errorf("IsStatusInProgress(%q) = true, want false", s)
+		}
+	}
+}
 
 func TestBucketFromStatus(t *testing.T) {
 	cases := map[string]CheckBucket{

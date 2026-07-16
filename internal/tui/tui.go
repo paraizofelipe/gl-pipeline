@@ -260,9 +260,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case startIntervalFetching:
 		cmds = append(cmds, m.fetchPRChecksWithInterval())
 
-	case startRunIntervalFetching:
-		cmds = append(cmds, m.fetchRunWithInterval())
-
 	case runModeFetchedMsg, runModeIntervalTickMsg:
 		var rmMsg runModeFetchedMsg
 		if tickMsg, ok := msg.(runModeIntervalTickMsg); ok {
@@ -292,6 +289,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastFetched = time.Now()
 		m.stopSpinners()
 		cmds = append(cmds, m.onWorkflowRunsFetched()...)
+
+		// Self-sustaining refresh loop: while the pipeline is still doing work,
+		// arm the next refetch. The guard runs here, on the freshly-updated
+		// model, so a manual job that just started keeps the loop alive. When
+		// the pipeline concludes, no tick is armed and polling stops on its own.
+		if m.isRunModeInProgress() {
+			cmds = append(cmds, m.scheduleRunRefetch())
+		} else {
+			log.Info("pipeline has concluded - not refetching anymore")
+		}
 
 	case prFetchedMsg:
 		m.pr = msg.pr
@@ -2245,7 +2252,7 @@ func (m *model) setDelegateSpinner(frame string) {
 func anyRunning(runs []data.WorkflowRun) bool {
 	for _, r := range runs {
 		for _, j := range r.Jobs {
-			if !j.StartedAt.IsZero() && j.CompletedAt.IsZero() {
+			if j.IsStatusInProgress() {
 				return true
 			}
 		}

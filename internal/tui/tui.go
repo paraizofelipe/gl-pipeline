@@ -517,7 +517,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.rerunRun(ri.run.Id)...)
 			} else {
 				ji := m.getSelectedJobItem()
-				if ri == nil && ji == nil {
+				if ji == nil {
 					break
 				}
 				rid := ""
